@@ -1,0 +1,11 @@
+[package]
+name = "udpdup"
+version = "0.1.0"
+authors = ["Albibek <albibek@gmail.com>"]
+
+[dependencies]
+net2="^0.2"
+futures="^0.1"
+tokio-core="^0.1" 
+bytes="^0.4"
+clap="^2.23"

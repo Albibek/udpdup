@@ -1,0 +1,3 @@
+The simpliest UDP multiplexor ever.
+Listens port, sends all packets to backends.
+Buffer is limited by queue size.
