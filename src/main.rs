@@ -7,8 +7,10 @@ extern crate net2;
 
 use std::net::SocketAddr;
 use net2::UdpBuilder;
+use std::thread;
+use std::sync::atomic::{ATOMIC_USIZE_INIT, AtomicUsize, Ordering};
 
-use tokio_core::reactor::Core;
+use tokio_core::reactor::{Core, Interval};
 use tokio_core::net::{UdpSocket, UdpCodec};
 
 use bytes::{Bytes, IntoBuf, Buf};
@@ -16,6 +18,8 @@ use futures::{Future, Stream, Sink};
 use futures::sync::mpsc::channel;
 
 use clap::{App, Arg};
+
+pub static CHUNK_COUNTER: AtomicUsize = ATOMIC_USIZE_INIT;
 
 struct DgramCodec {
     addr: SocketAddr,
@@ -70,53 +74,90 @@ fn main() {
              .multiple(true)
              .takes_value(true)
             )
+         .arg(Arg::with_name("nthreads")
+             .short("n")
+             .long("nthreads")
+             .takes_value(true)
+             .default_value("0")
+            )
         .get_matches();
 
     let listen = value_t!(matches.value_of("listen"), SocketAddr).unwrap_or_else(|e| e.exit());
     let backends = values_t!(matches.values_of("backend"), SocketAddr).unwrap_or_else(|e| e.exit());
     let size = value_t!(matches.value_of("queue_size"), usize).unwrap_or_else(|e| e.exit());
+    let nthreads = value_t!(matches.value_of("nthreads"), usize).unwrap_or_else(|e| e.exit());
 
+    // Init chunk counter
+    // In the main thread start a reporting timer
     let mut core = Core::new().unwrap();
     let handle = core.handle();
+
+    let timer = Interval::new(::std::time::Duration::from_secs(1), &handle).unwrap();
+    let timer = timer.for_each(|()|{
+                println!("chunks: {:?}", CHUNK_COUNTER.load(Ordering::Relaxed));
+                CHUNK_COUNTER.store(0, Ordering::Relaxed);
+                //println!("total drops: {:?}", METRIC_DROPS.load(Ordering::Relaxed));
+                Ok(())
+    });
 
     let socket = UdpBuilder::new_v4().unwrap();
     let socket = socket.bind(&listen).unwrap();
 
-    let sender = UdpSocket::from_socket(socket, &handle).unwrap();
-    let server = sender.framed(DgramCodec::new(listen));
+    // Create sockets from backend addresses
+    let senders = backends
+        .iter()
+        .map(|_| {
+                 let socket = UdpBuilder::new_v4().unwrap();
+                 let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                 socket.bind(&bind).unwrap()
+             })
+        .collect::<Vec<_>>();
 
-    let mut chans = Vec::new();
 
-    for b in backends.into_iter() {
-        let (tx, rx) = channel::<Bytes>(size);
-        chans.push(tx);
+    for _ in 1..8 {
+        // create clone of each sender socket for thread
+        let senders = senders
+            .iter()
+            .map(|socket| socket.try_clone().unwrap())
+            .collect::<Vec<_>>();
 
-        ::std::thread::spawn(move || {
+        let socket = socket.try_clone().unwrap();
+        let mut backends = backends.clone();
+        thread::spawn(move || {
+            // each thread runs it's own core
             let mut core = Core::new().unwrap();
             let handle = core.handle();
-            let socket = UdpBuilder::new_v4().unwrap();
-            let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
-            let socket = socket.bind(&bind).unwrap();
 
-            let sender = UdpSocket::from_socket(socket, &handle).unwrap();
-            let sender = sender
-                .framed(DgramCodec::new(b))
-                .sink_map_err(|e| println!("SEND ERROR: {:?}", e));
-            let sender = rx.forward(sender).map(|_| ());
-            core.run(sender)
+            // make senders into framed UDP
+            let mut senders = senders
+                .into_iter()
+                .map(|socket| {
+                         let sender = UdpSocket::from_socket(socket, &handle).unwrap();
+                         // socket order becomes reversed but we don't care about this
+                         // because the order is same everywhere
+                         let sender = sender.framed(DgramCodec::new(backends.pop().unwrap()));
+                         sender
+                     })
+                .collect::<Vec<_>>();
+
+            // create server now
+            let socket = UdpSocket::from_socket(socket, &handle).unwrap();
+            let server = socket.framed(DgramCodec::new(listen));
+
+            let server = server.for_each(move |buf| {
+                CHUNK_COUNTER.fetch_add(1, Ordering::Relaxed);
+                senders
+                    .iter_mut()
+                    .map(|sender| {
+                             sender.start_send(buf.clone()).unwrap();
+                             sender.poll_complete().unwrap();
+                         })
+                    .last();
+                Ok(())
+            });
+
+            core.run(server).unwrap();
         });
     }
-
-    let server = server.for_each(move |buf| {
-        chans
-            .iter_mut()
-            .map(|tx| {
-                     tx.start_send(buf.clone()).unwrap();
-                     tx.poll_complete().unwrap();
-                 })
-            .last();
-        Ok(())
-    });
-
-    core.run(server).unwrap();
+    core.run(timer).unwrap();
 }
