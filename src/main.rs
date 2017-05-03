@@ -14,8 +14,7 @@ use tokio_core::reactor::{Core, Interval};
 use tokio_core::net::{UdpSocket, UdpCodec};
 
 use bytes::{Bytes, IntoBuf, Buf};
-use futures::{Future, Stream, Sink};
-use futures::sync::mpsc::channel;
+use futures::{Stream, Sink};
 
 use clap::{App, Arg};
 
@@ -60,12 +59,6 @@ fn main() {
              .value_name("IP:PORT")
              .help("ip and port to listen to")
              .takes_value(true))
-        .arg(Arg::with_name("queue_size")
-             .short("q")
-             .long("queue")
-             .takes_value(true)
-             .default_value("1048576")
-            )
         .arg(Arg::with_name("backend")
              .short("b")
              .long("backend")
@@ -84,7 +77,6 @@ fn main() {
 
     let listen = value_t!(matches.value_of("listen"), SocketAddr).unwrap_or_else(|e| e.exit());
     let backends = values_t!(matches.values_of("backend"), SocketAddr).unwrap_or_else(|e| e.exit());
-    let size = value_t!(matches.value_of("queue_size"), usize).unwrap_or_else(|e| e.exit());
     let nthreads = value_t!(matches.value_of("nthreads"), usize).unwrap_or_else(|e| e.exit());
 
     // Init chunk counter
@@ -114,7 +106,7 @@ fn main() {
         .collect::<Vec<_>>();
 
 
-    for _ in 1..8 {
+    for _ in 0..nthreads {
         // create clone of each sender socket for thread
         let senders = senders
             .iter()
