@@ -44,9 +44,9 @@ impl UdpCodec for DgramCodec {
     fn decode(&mut self,
               _src: &SocketAddr,
               buf: &[u8])
-              -> ::std::result::Result<Self::In, ::std::io::Error> {
-        Ok(buf.into())
-    }
+        -> ::std::result::Result<Self::In, ::std::io::Error> {
+            Ok(buf.into())
+        }
 
     fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>) -> SocketAddr {
         use std::io::Read;
@@ -56,10 +56,10 @@ impl UdpCodec for DgramCodec {
 }
 
 fn main() {
-    let matches = App::new("MEGA UDP DUPLICATOR")
-        .version("0.0.0.0.0.0.1alpha")
+    let matches = App::new("Simple UDP duplicator")
+        .version("0.1.0")
         .author("Sergey Noskov <snoskov@avito.ru>")
-        .about("UDP multiplexor: copies packets from listened address to specified backends")
+        .about("UDP multiplexor: copies packets from listened address to specified backends dropping packets on any error")
         .arg(Arg::with_name("listen")
              .short("l")
              .long("listen")
@@ -115,11 +115,11 @@ fn main() {
         let drops = DROP_COUNTER.load(Ordering::Relaxed) as f64 / interval;
         let errors = ERR_COUNTER.load(Ordering::Relaxed) as f64 / interval;
 
-    println!("chunks/drops/errors: {:.2}/{:.2}/{:.2}", chunks, drops, errors);
-    CHUNK_COUNTER.store(0, Ordering::Relaxed);
-    DROP_COUNTER.store(0, Ordering::Relaxed);
-    ERR_COUNTER.store(0, Ordering::Relaxed);
-    Ok(())
+        println!("chunks/drops/errors: {:.2}/{:.2}/{:.2}", chunks, drops, errors);
+        CHUNK_COUNTER.store(0, Ordering::Relaxed);
+        DROP_COUNTER.store(0, Ordering::Relaxed);
+        ERR_COUNTER.store(0, Ordering::Relaxed);
+        Ok(())
     });
 
     let socket = UdpBuilder::new_v4().unwrap();
@@ -131,11 +131,11 @@ fn main() {
     let senders = backends
         .iter()
         .map(|_| {
-                 let socket = UdpBuilder::new_v4().unwrap();
-                 let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                 socket.bind(&bind).unwrap()
-             })
-        .collect::<Vec<_>>();
+            let socket = UdpBuilder::new_v4().unwrap();
+            let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
+            socket.bind(&bind).unwrap()
+        })
+    .collect::<Vec<_>>();
 
 
     for _ in 0..nthreads {
@@ -165,7 +165,7 @@ fn main() {
                         .buffer(bufsize);
                     sender
                 })
-                .collect::<Vec<_>>();
+            .collect::<Vec<_>>();
 
             // create server now
             let socket = UdpSocket::from_socket(socket, &handle).unwrap();
@@ -192,7 +192,7 @@ fn main() {
                             }
                         }
                     })
-                    .last();
+                .last();
                 Ok(())
             });
 
