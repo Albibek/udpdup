@@ -4,6 +4,7 @@ extern crate bytes;
 extern crate futures;
 extern crate tokio_core;
 extern crate net2;
+extern crate num_cpus;
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -87,6 +88,7 @@ fn main() {
              .long("nthreads")
              .takes_value(true)
              .default_value("0")
+             .help("Number of worker threads, use 0 to use all CPU cores")
             )
         .arg(Arg::with_name("interval")
              .short("t")
@@ -99,10 +101,13 @@ fn main() {
 
     let listen = value_t!(matches.value_of("listen"), SocketAddr).unwrap_or_else(|e| e.exit());
     let backends = values_t!(matches.values_of("backend"), SocketAddr).unwrap_or_else(|e| e.exit());
-    let nthreads = value_t!(matches.value_of("nthreads"), usize).unwrap_or_else(|e| e.exit());
+    let mut nthreads = value_t!(matches.value_of("nthreads"), usize).unwrap_or_else(|e| e.exit());
     let bufsize = value_t!(matches.value_of("bufsize"), usize).unwrap_or_else(|e| e.exit());
     let interval = value_t!(matches.value_of("interval"), u64).unwrap_or_else(|e| e.exit());
 
+    if nthreads == 0 {
+        nthreads = num_cpus::get();
+    }
     // Init chunk counter
     // In the main thread start a reporting timer
     let mut core = Core::new().unwrap();

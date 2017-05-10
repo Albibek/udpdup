@@ -1,6 +1,6 @@
 [package]
 name = "udpdup"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Albibek <albibek@gmail.com>"]
 
 [dependencies]
@@ -9,6 +9,8 @@ futures="^0.1"
 tokio-core="^0.1" 
 bytes="^0.4"
 clap="^2.23"
+num_cpus="^1.4"
+
 
 [profile.release]
 opt-level = 3
