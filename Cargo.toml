@@ -9,3 +9,12 @@ futures="^0.1"
 tokio-core="^0.1" 
 bytes="^0.4"
 clap="^2.23"
+
+[profile.release]
+opt-level = 3
+debug = false
+rpath = false
+lto = false
+debug-assertions = false
+codegen-units = 1
+panic = 'unwind'
