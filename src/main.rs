@@ -5,12 +5,14 @@ extern crate futures;
 extern crate tokio_core;
 extern crate net2;
 extern crate num_cpus;
+extern crate resolve;
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use net2::UdpBuilder;
 use net2::unix::UnixUdpBuilderExt;
+use resolve::resolver;
 
 use std::thread;
 use std::sync::atomic::{ATOMIC_USIZE_INIT, AtomicUsize, Ordering};
@@ -45,9 +47,9 @@ impl UdpCodec for DgramCodec {
     fn decode(&mut self,
               _src: &SocketAddr,
               buf: &[u8])
-        -> ::std::result::Result<Self::In, ::std::io::Error> {
-            Ok(buf.into())
-        }
+              -> ::std::result::Result<Self::In, ::std::io::Error> {
+        Ok(buf.into())
+    }
 
     fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>) -> SocketAddr {
         use std::io::Read;
@@ -100,7 +102,7 @@ fn main() {
         .get_matches();
 
     let listen = value_t!(matches.value_of("listen"), SocketAddr).unwrap_or_else(|e| e.exit());
-    let backends = values_t!(matches.values_of("backend"), SocketAddr).unwrap_or_else(|e| e.exit());
+    let backends = values_t!(matches.values_of("backend"), String).unwrap_or_else(|e| e.exit());
     let mut nthreads = value_t!(matches.value_of("nthreads"), usize).unwrap_or_else(|e| e.exit());
     let bufsize = value_t!(matches.value_of("bufsize"), usize).unwrap_or_else(|e| e.exit());
     let interval = value_t!(matches.value_of("interval"), u64).unwrap_or_else(|e| e.exit());
@@ -132,16 +134,37 @@ fn main() {
     socket.reuse_port(true).unwrap();
     let socket = socket.bind(&listen).unwrap();
 
-    // Create sockets from backend addresses
+
+    let backends = backends
+        .iter()
+        .map(|b| {
+            b.parse()
+                .unwrap_or_else(|_| {
+                    // for name that failed to parse we try to resolve it via DNS
+
+                    let mut split = b.split(':');
+                    let host = split.next().unwrap(); // Split always has first element
+                    let port = split.next().expect("port not found"); // Split always has first element
+                    let port = port.parse().expect("bad port value");
+
+                    let first_ip = resolver::resolve_host(host)
+                        .unwrap()
+                        .next()
+                        .expect("at least one IP address required");
+                    SocketAddr::new(first_ip, port)
+                })
+        })
+        .collect::<Vec<SocketAddr>>();
+
+    // Create sockets for each backend address
     let senders = backends
         .iter()
         .map(|_| {
-            let socket = UdpBuilder::new_v4().unwrap();
-            let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
-            socket.bind(&bind).unwrap()
-        })
-    .collect::<Vec<_>>();
-
+                 let socket = UdpBuilder::new_v4().unwrap();
+                 let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                 socket.bind(&bind).unwrap()
+             })
+        .collect::<Vec<_>>();
 
     for _ in 0..nthreads {
         // create clone of each sender socket for thread
@@ -170,7 +193,7 @@ fn main() {
                         .buffer(bufsize);
                     sender
                 })
-            .collect::<Vec<_>>();
+                .collect::<Vec<_>>();
 
             // create server now
             let socket = UdpSocket::from_socket(socket, &handle).unwrap();
@@ -197,7 +220,7 @@ fn main() {
                             }
                         }
                     })
-                .last();
+                    .last();
                 Ok(())
             });
 
