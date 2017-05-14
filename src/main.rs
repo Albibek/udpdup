@@ -1,14 +1,17 @@
-#[macro_use]
 extern crate clap;
+#[macro_use]
+extern crate structopt_derive;
+extern crate structopt;
 extern crate bytes;
 extern crate futures;
 extern crate tokio_core;
+extern crate tokio_io;
 extern crate net2;
 extern crate num_cpus;
 extern crate resolve;
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{self, Duration, SystemTime};
 
 use net2::UdpBuilder;
 use net2::unix::UnixUdpBuilderExt;
@@ -17,18 +20,19 @@ use resolve::resolver;
 use std::thread;
 use std::sync::atomic::{ATOMIC_USIZE_INIT, AtomicUsize, Ordering};
 
-use tokio_core::reactor::{Core, Interval};
-use tokio_core::net::{UdpSocket, UdpCodec};
+use tokio_core::reactor::{Core, Interval, Timeout};
+use tokio_core::net::{UdpSocket, UdpCodec, TcpStream};
+use tokio_io::AsyncWrite;
 
-use bytes::{Bytes, IntoBuf, Buf};
-use futures::{Stream, Sink, AsyncSink};
+use bytes::{Bytes, IntoBuf, Buf, BytesMut, BufMut};
+use futures::{Stream, Sink, AsyncSink, Future};
 
-use clap::{App, Arg};
+
+use structopt::StructOpt;
 
 pub static CHUNK_COUNTER: AtomicUsize = ATOMIC_USIZE_INIT;
 pub static DROP_COUNTER: AtomicUsize = ATOMIC_USIZE_INIT;
 pub static ERR_COUNTER: AtomicUsize = ATOMIC_USIZE_INIT;
-
 
 struct DgramCodec {
     addr: SocketAddr,
@@ -58,102 +62,131 @@ impl UdpCodec for DgramCodec {
     }
 }
 
+fn try_resolve(s: &str) -> SocketAddr {
+    s.parse()
+        .unwrap_or_else(|_| {
+            // for name that have failed to be parsed we try to resolve it via DNS
+            let mut split = s.split(':');
+            let host = split.next().unwrap(); // Split always has first element
+            let port = split.next().expect("port not found");
+            let port = port.parse().expect("bad port value");
+
+            let first_ip = resolver::resolve_host(host)
+                .expect("failed resolving backend name")
+                .next()
+                .expect("at least one IP address required");
+            SocketAddr::new(first_ip, port)
+        })
+}
+
+#[derive(StructOpt, Debug)]
+#[structopt(about = "UDP multiplexor: copies packets from listened address to specified backends dropping packets on any error")]
+struct Options {
+    #[structopt(short = "l", long = "listen", help = "Address and port to listen to")]
+    listen: SocketAddr,
+
+    #[structopt(short = "b", long = "backend", help = "IP and port of a backend to forward data to. Can be specified multiple times.", value_name="IP:PORT")]
+    backends: Vec<String>,
+
+    #[structopt(short = "n", long = "nthreads", help = "Number of worker threads, use 0 to use all CPU cores", default_value = "0")]
+    nthreads: usize,
+
+    #[structopt(short = "s", long = "size", help = "Internal queue buffer size in packets", default_value = "1048576")]
+    bufsize: usize,
+
+    #[structopt(short = "t", long = "interval", help = "Stats printing/sending interval, in milliseconds", default_value = "1000")]
+    interval: Option<u64>, // u64 has a special meaning in structopt
+
+    #[structopt(short = "P", long = "stats-prefix", help = "Metric name prefix", default_value="")]
+    stats_prefix: String,
+
+    #[structopt(short = "S", long = "stats", help = "Graphite plaintext format compatible address:port to send metrics to")]
+    stats: Option<String>,
+}
+
 fn main() {
-    let matches = App::new("Simple UDP duplicator")
-        .version("0.1.0")
-        .author("Sergey Noskov <snoskov@avito.ru>")
-        .about("UDP multiplexor: copies packets from listened address to specified backends dropping packets on any error")
-        .arg(Arg::with_name("listen")
-             .short("l")
-             .long("listen")
-             .value_name("IP:PORT")
-             .takes_value(true)
-             .help("ip and port to listen to")
-            )
-        .arg(Arg::with_name("backend")
-             .short("b")
-             .long("backend")
-             .value_name("IP:PORT")
-             .multiple(true)
-             .takes_value(true)
-             .help("IP and port of a backend to forward data to. Can be specified multiple times.")
-            )
-        .arg(Arg::with_name("bufsize")
-             .help("Internal queue buffer size")
-             .short("s")
-             .long("size")
-             .takes_value(true)
-             .default_value("1048576")
-            )
-        .arg(Arg::with_name("nthreads")
-             .short("n")
-             .long("nthreads")
-             .takes_value(true)
-             .default_value("0")
-             .help("Number of worker threads, use 0 to use all CPU cores")
-            )
-        .arg(Arg::with_name("interval")
-             .short("t")
-             .long("interval")
-             .takes_value(true)
-             .default_value("1000")
-             .help("Stats printing interval (in milliseconds)")
-            )
-        .get_matches();
+    let mut opts = Options::from_args();
 
-    let listen = value_t!(matches.value_of("listen"), SocketAddr).unwrap_or_else(|e| e.exit());
-    let backends = values_t!(matches.values_of("backend"), String).unwrap_or_else(|e| e.exit());
-    let mut nthreads = value_t!(matches.value_of("nthreads"), usize).unwrap_or_else(|e| e.exit());
-    let bufsize = value_t!(matches.value_of("bufsize"), usize).unwrap_or_else(|e| e.exit());
-    let interval = value_t!(matches.value_of("interval"), u64).unwrap_or_else(|e| e.exit());
-
-    if nthreads == 0 {
-        nthreads = num_cpus::get();
+    if opts.nthreads == 0 {
+        opts.nthreads = num_cpus::get();
     }
+
     // Init chunk counter
     // In the main thread start a reporting timer
     let mut core = Core::new().unwrap();
     let handle = core.handle();
 
-    let timer = Interval::new(Duration::from_millis(interval), &handle).unwrap();
+    let timer = Interval::new(Duration::from_millis(opts.interval.unwrap()), &handle).unwrap();
+    let interval = opts.interval.unwrap() as f64 / 1000f64;
+
+    let stats = opts.stats.map(|ref stats| try_resolve(stats));
+
+    let prefix = opts.stats_prefix;
+
     let timer = timer.for_each(|()|{
-        let interval = interval as f64 / 1000f64;
-        let chunks = CHUNK_COUNTER.load(Ordering::Relaxed) as f64 / interval;
-        let drops = DROP_COUNTER.load(Ordering::Relaxed) as f64 / interval;
-        let errors = ERR_COUNTER.load(Ordering::Relaxed) as f64 / interval;
+        let chunks = CHUNK_COUNTER.swap(0, Ordering::Relaxed) as f64 / interval;
+        let drops = DROP_COUNTER.swap(0, Ordering::Relaxed) as f64 / interval;
+        let errors = ERR_COUNTER.swap(0, Ordering::Relaxed) as f64 / interval;
 
         println!("chunks/drops/errors: {:.2}/{:.2}/{:.2}", chunks, drops, errors);
-        CHUNK_COUNTER.store(0, Ordering::Relaxed);
-        DROP_COUNTER.store(0, Ordering::Relaxed);
-        ERR_COUNTER.store(0, Ordering::Relaxed);
+
+        match stats {
+            Some(addr) => {
+                let tcp_timeout = Timeout::new(Duration::from_millis(((interval / 2f64) * 1000f64).floor() as u64), &handle)
+                    .unwrap()
+                    .map_err(|_| ());
+                let prefix = prefix.clone();
+                let sender = TcpStream::connect(&addr, &handle).and_then(move |mut conn| {
+                     let ts = SystemTime::now()
+                        .duration_since(time::UNIX_EPOCH).unwrap();
+                    let ts = ts.as_secs().to_string();
+                    // prefix length can be various sizes, we need capacity for it,
+                    // we also need space for other values that are around:
+                    // 2 spaces, 7 chars for metric suffix
+                    // around 26 chars for f64 value, but cannot be sure it takes more
+                    // around 10 chars for timestamp
+                    // so minimal value is ~45, we'll take 128 just in case float is very large
+                    // for 3 metrics this must be tripled
+                    let mut buf = BytesMut::with_capacity((prefix.len() + 128)*3);
+
+                    buf.put(&prefix);
+                    buf.put(".udpdup.chunks ");
+                    buf.put(chunks.to_string());
+                    buf.put(" ");
+                    buf.put(&ts);
+                    buf.put("\n");
+
+                    buf.put(&prefix);
+                    buf.put(".udpdup.drops ");
+                    buf.put(drops.to_string());
+                    buf.put(" ");
+                    buf.put(&ts);
+                    buf.put("\n");
+
+                    buf.put(&prefix);
+                    buf.put(".udpdup.errors ");
+                    buf.put(errors.to_string());
+                    buf.put(" ");
+                    buf.put(&ts);
+
+                    conn.write_buf(&mut buf.into_buf()).map(|_|())
+                }).map_err(|e| println!("Error sending stats: {:?}", e)).select(tcp_timeout).then(|_|Ok(()));
+               handle.spawn(sender);
+            }
+            None => (),
+        };
         Ok(())
     });
 
+    // Now the min server work
     let socket = UdpBuilder::new_v4().unwrap();
     socket.reuse_address(true).unwrap();
     socket.reuse_port(true).unwrap();
-    let socket = socket.bind(&listen).unwrap();
+    let socket = socket.bind(&opts.listen).unwrap();
 
-
-    let backends = backends
+    let backends = opts.backends
         .iter()
-        .map(|b| {
-            b.parse()
-                .unwrap_or_else(|_| {
-                    // for name that failed to parse we try to resolve it via DNS
-
-                    let mut split = b.split(':');
-                    let host = split.next().unwrap(); // Split always has first element
-                    let port = split.next().expect("port not found"); // Split always has first element
-                    let port = port.parse().expect("bad port value");
-
-                    let first_ip = resolver::resolve_host(host)
-                        .unwrap()
-                        .next()
-                        .expect("at least one IP address required");
-                    SocketAddr::new(first_ip, port)
-                })
-        })
+        .map(|b| try_resolve(b))
         .collect::<Vec<SocketAddr>>();
 
     // Create sockets for each backend address
@@ -166,7 +199,9 @@ fn main() {
              })
         .collect::<Vec<_>>();
 
-    for _ in 0..nthreads {
+    let bufsize = opts.bufsize;
+    let listen = opts.listen;
+    for _ in 0..opts.nthreads {
         // create clone of each sender socket for thread
         let senders = senders
             .iter()
