@@ -51,9 +51,9 @@ impl UdpCodec for DgramCodec {
     fn decode(&mut self,
               _src: &SocketAddr,
               buf: &[u8])
-        -> ::std::result::Result<Self::In, ::std::io::Error> {
-            Ok(buf.into())
-        }
+              -> ::std::result::Result<Self::In, ::std::io::Error> {
+        Ok(buf.into())
+    }
 
     fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>) -> SocketAddr {
         use std::io::Read;
@@ -91,7 +91,10 @@ struct Options {
     #[structopt(short = "n", long = "nthreads", help = "Number of worker threads, use 0 to use all CPU cores", default_value = "0")]
     nthreads: usize,
 
-    #[structopt(short = "g", long = "greens", help = "Number of green threads per worker hread", default_value = "10")]
+    #[structopt(short = "p", long = "pool", help = "Socket pool size", default_value = "16")]
+    snum: usize,
+
+    #[structopt(short = "g", long = "greens", help = "Number of green threads per worker hread", default_value = "4")]
     greens: usize,
 
     #[structopt(short = "s", long = "size", help = "Internal queue buffer size in packets", default_value = "1048576")]
@@ -185,20 +188,28 @@ fn main() {
         .map(|b| try_resolve(b))
         .collect::<Vec<SocketAddr>>();
 
+    // Create a pool of listener sockets
+    let mut sockets = Vec::new();
+    for _ in 0..opts.snum {
+        let socket = UdpBuilder::new_v4().unwrap();
+        socket.reuse_address(true).unwrap();
+        socket.reuse_port(true).unwrap();
+        let socket = socket.bind(&opts.listen).unwrap();
+        sockets.push(socket);
+    }
 
     let bufsize = opts.bufsize;
     let listen = opts.listen;
+    let greens = opts.greens;
     for i in 0..opts.nthreads {
-        // create clone of each sender socket for thread
-        //    let senders = senders
-        //.iter()
-        //.map(|socket| socket.try_clone().unwrap())
-        //.collect::<Vec<_>>();
-
-        //  let socket = socket.try_clone().unwrap();
-
         let backends = backends.clone();
-        let greens = opts.greens;
+
+        // Each thread gets the clone of a socket pool
+        let sockets = sockets
+            .iter()
+            .map(|s| s.try_clone().unwrap())
+            .collect::<Vec<_>>();
+
         thread::Builder::new()
             .name(format!("udpdup_worker{}", i).into())
             .spawn(move || {
@@ -206,79 +217,75 @@ fn main() {
                 let mut core = Core::new().unwrap();
                 let handle = core.handle();
 
-                // Create server socket
-                let socket = UdpBuilder::new_v4().unwrap();
-                socket.reuse_address(true).unwrap();
-                socket.reuse_port(true).unwrap();
-                let socket = socket.bind(&listen).unwrap();
-
                 // Create sockets for each backend address
                 let senders = backends
                     .iter()
                     .map(|_| {
-                        let socket = UdpBuilder::new_v4().unwrap();
-                        let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                        socket.bind(&bind).unwrap()
-                    })
-                .collect::<Vec<_>>();
-
-                for _ in 0..greens {
-
-                    let senders = senders
-                        .iter()
-                        .map(|socket| socket.try_clone().expect("client socket cloning"))
-                        .collect::<Vec<_>>();
-
-                    // make senders into framed UDP
-                    let mut backends = backends.clone();
-                    let mut senders = senders
-                        .into_iter()
-                        .map(|socket| {
-                            let sender = UdpSocket::from_socket(socket, &handle).unwrap();
-                            // socket order becomes reversed but we don't care about this
-                            // because the order is same everywhere
-                            // and anyways, we push same data to every socket
-                            let sender = sender
-                                .framed(DgramCodec::new(backends.pop().unwrap()))
-                                .buffer(bufsize);
-                            sender
-                        })
+                             let socket = UdpBuilder::new_v4().unwrap();
+                             let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                             socket.bind(&bind).unwrap()
+                         })
                     .collect::<Vec<_>>();
 
-                    // create server now
-                    let socket = socket.try_clone().expect("server socket cloning");
-                    let socket = UdpSocket::from_socket(socket, &handle).unwrap();
-                    let server = socket.framed(DgramCodec::new(listen)).buffer(bufsize);
+                for _ in 0..greens {
+                    for socket in sockets.iter() {
+                        let senders = senders
+                            .iter()
+                            .map(|socket| socket.try_clone().expect("client socket cloning"))
+                            .collect::<Vec<_>>();
 
-                    let server = server.for_each(move |buf| {
-                        CHUNK_COUNTER.fetch_add(1, Ordering::Relaxed);
-                        senders
-                            .iter_mut()
-                            .map(|sender| {
-                                let res = sender.start_send(buf.clone());
-                                match res {
-                                    Err(_) => {
-                                        ERR_COUNTER.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    Ok(AsyncSink::NotReady(_)) => {
-                                        DROP_COUNTER.fetch_add(1, Ordering::Relaxed);
-                                    }
-                                    Ok(AsyncSink::Ready) => {
-                                        let res = sender.poll_complete();
-                                        if res.is_err() {
+                        // make senders into framed UDP
+                        let mut backends = backends.clone();
+                        let mut senders = senders
+                            .into_iter()
+                            .map(|socket| {
+                                let sender = UdpSocket::from_socket(socket, &handle).unwrap();
+                                // socket order becomes reversed but we don't care about this
+                                // because the order is same everywhere
+                                // and anyways, we push same data to every socket
+                                let sender = sender
+                                    .framed(DgramCodec::new(backends.pop().unwrap()))
+                                    .buffer(bufsize);
+                                sender
+                            })
+                            .collect::<Vec<_>>();
+
+                        // create server now
+                        let socket = socket.try_clone().expect("server socket cloning");
+                        let socket = UdpSocket::from_socket(socket, &handle).unwrap();
+                        let server = socket.framed(DgramCodec::new(listen)).buffer(bufsize);
+
+                        let server = server.for_each(move |buf| {
+                            CHUNK_COUNTER.fetch_add(1, Ordering::Relaxed);
+                            senders
+                                .iter_mut()
+                                .map(|sender| {
+                                    let res = sender.start_send(buf.clone());
+                                    match res {
+                                        Err(_) => {
                                             ERR_COUNTER.fetch_add(1, Ordering::Relaxed);
                                         }
+                                        Ok(AsyncSink::NotReady(_)) => {
+                                            DROP_COUNTER.fetch_add(1, Ordering::Relaxed);
+                                        }
+                                        Ok(AsyncSink::Ready) => {
+                                            let res = sender.poll_complete();
+                                            if res.is_err() {
+                                                ERR_COUNTER.fetch_add(1, Ordering::Relaxed);
+                                            }
+                                        }
                                     }
-                                }
-                            })
-                        .last();
-                        Ok(())
-                    });
+                                })
+                                .last();
+                            Ok(())
+                        });
 
-                    handle.spawn(server.map_err(|_|()));
+                        handle.spawn(server.map_err(|_| ()));
+                    }
                 }
                 core.run(::futures::future::empty::<(), ()>()).unwrap();
-            }).unwrap();
+            })
+            .unwrap();
     }
     core.run(timer).unwrap();
 }
