@@ -117,6 +117,14 @@ fn main() {
         opts.nthreads = num_cpus::get();
     }
 
+    if opts.snum == 0 {
+        panic!("Number of sockets cannot be zero")
+    }
+
+    if opts.greens == 0 {
+        panic!("Number of green threads cannot be zero")
+    }
+
     // Init chunk counter
     // In the main thread start a reporting timer
     let mut core = Core::new().unwrap();
@@ -287,5 +295,6 @@ fn main() {
             })
             .unwrap();
     }
+    drop(sockets);
     core.run(timer).unwrap();
 }

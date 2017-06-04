@@ -1,3 +1,21 @@
-The simpliest UDP multiplexor ever.
-Listens port, sends all packets to backends.
-Buffer is limited by queue size.
+The UDP packet multiplexor: copies data from the incoming socket to all backends.
+
+Written in Rust, using tokio framework, so it's async, performant and tunable for specific workloads.
+
+Requires support of SO_REUSEADDR, SO_REUSEPORT socket options.
+
+The listening socket is created a number of times. This number can be set using `-p` parameter.
+When making a number of listening sockets instead of one ths OS(only tested this on Linux) seems
+to give the buffer for each of the sockets, but packets are distributed between those buffers on per-client
+base. In other words, Linux places all the packets from single client into the same buffer.
+Having a single client that sends a lots of packets, this will lead to all packets appear in the same buffer.
+To avoid exhaustion from such a client, a copy of each socket buffer is given to each thread at least once and
+a green thread is run to process this buffer. One can run more than one green thread per socket buffer to get async
+processing, but this can decrease performance. Our experiments and common sence show that a low number(1-4) of green
+threads could give best result, but it's up to user to experiment.
+
+Statistics about basic program usage can be sent in Carbon plaintext format if the corresponding option is specified.
+
+One should also consider about opened file descriptors limit on the system. Each green thread uses at least one 
+file descriptor for server and one descriptor per backend client connection. 
+Each thread also additionally uses at least 1 file descriptor.
