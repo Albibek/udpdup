@@ -51,9 +51,9 @@ impl UdpCodec for DgramCodec {
     fn decode(&mut self,
               _src: &SocketAddr,
               buf: &[u8])
-              -> ::std::result::Result<Self::In, ::std::io::Error> {
-        Ok(buf.into())
-    }
+        -> ::std::result::Result<Self::In, ::std::io::Error> {
+            Ok(buf.into())
+        }
 
     fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>) -> SocketAddr {
         use std::io::Read;
@@ -91,7 +91,7 @@ struct Options {
     #[structopt(short = "n", long = "nthreads", help = "Number of worker threads, use 0 to use all CPU cores", default_value = "0")]
     nthreads: usize,
 
-    #[structopt(short = "p", long = "pool", help = "Socket pool size", default_value = "16")]
+    #[structopt(short = "p", long = "pool", help = "Socket pool size", default_value = "4")]
     snum: usize,
 
     #[structopt(short = "g", long = "greens", help = "Number of green threads per worker hread", default_value = "4")]
@@ -229,11 +229,11 @@ fn main() {
                 let senders = backends
                     .iter()
                     .map(|_| {
-                             let socket = UdpBuilder::new_v4().unwrap();
-                             let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                             socket.bind(&bind).unwrap()
-                         })
-                    .collect::<Vec<_>>();
+                        let socket = UdpBuilder::new_v4().unwrap();
+                        let bind: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                        socket.bind(&bind).unwrap()
+                    })
+                .collect::<Vec<_>>();
 
                 for _ in 0..greens {
                     for socket in sockets.iter() {
@@ -256,7 +256,7 @@ fn main() {
                                     .buffer(bufsize);
                                 sender
                             })
-                            .collect::<Vec<_>>();
+                        .collect::<Vec<_>>();
 
                         // create server now
                         let socket = socket.try_clone().expect("server socket cloning");
@@ -284,7 +284,7 @@ fn main() {
                                         }
                                     }
                                 })
-                                .last();
+                            .last();
                             Ok(())
                         });
 
@@ -293,7 +293,7 @@ fn main() {
                 }
                 core.run(::futures::future::empty::<(), ()>()).unwrap();
             })
-            .unwrap();
+        .unwrap();
     }
     drop(sockets);
     core.run(timer).unwrap();
